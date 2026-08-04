@@ -26,6 +26,7 @@ SCOPES = [
 MASTER_TAB = "Master Data"
 NAMES_TAB = "Names"
 RUNS_TAB = "Runs"
+CLINICS_TAB = "Clinics"
 
 MASTER_DATA_COLUMNS = [
     "APPOINTMENT DATE", "APPOINTMENT TYPE", "PATIENT", "CASE", "CLINIC",
@@ -109,6 +110,56 @@ def load_existing_keys(ws) -> set:
     return keys
 
 
+def update_clinics_tab(spreadsheet, all_clinics: list[str]) -> None:
+    """
+    Overwrites the 'Clinics' tab with the FULL list of clinics WebPT reported
+    on this run (regardless of whether this particular run was scoped to a
+    subset via CLINIC_NAMES). This is what the web app's clinic multi-select
+    reads from, so it stays accurate even after a partial/filtered run.
+    """
+    if not all_clinics:
+        return
+    ws = get_or_create_worksheet(spreadsheet, CLINICS_TAB, header=["Clinic"])
+    ws.clear()
+    ws.append_row(["Clinic"], value_input_option="RAW")
+    ws.append_rows([[c] for c in sorted(all_clinics)], value_input_option="RAW")
+    print(f"   🏥 Refreshed '{CLINICS_TAB}' tab with {len(all_clinics)} clinic(s).")
+
+
+def final_dedupe_pass(ws) -> int:
+    """
+    Explicit final safety net: re-reads the WHOLE Master Data tab and drops
+    any duplicate rows by the same dedupe key, rewriting the tab if any were
+    found. The append step already skips rows that match something already
+    present, so this should normally be a no-op — it exists to guarantee
+    correctness even if something ever got in another way (a manual paste,
+    a race between two runs, etc.), per explicit request: "at the end we
+    drop duplicates to make sure everything is accurate."
+    """
+    values = ws.get_all_values()
+    if len(values) < 2:
+        return 0
+    header, data_rows = values[0], values[1:]
+    df = pd.DataFrame(data_rows, columns=header)
+
+    missing_cols = [c for c in DEDUPE_KEY if c not in df.columns]
+    if missing_cols:
+        return 0
+
+    before = len(df)
+    df.drop_duplicates(subset=DEDUPE_KEY, keep="first", inplace=True)
+    after = len(df)
+    removed = before - after
+    if removed > 0:
+        print(f"   🧹 Final dedupe pass removed {removed} duplicate row(s) from '{MASTER_TAB}'.")
+        ws.clear()
+        ws.append_row(header, value_input_option="RAW")
+        if not df.empty:
+            values_out = df.astype(object).where(pd.notnull(df), "").values.tolist()
+            ws.append_rows(values_out, value_input_option="USER_ENTERED")
+    return removed
+
+
 def write_to_sheet(cleaned_df: pd.DataFrame, start_date: str, end_date: str) -> dict:
     sheet_id = os.environ.get("SHEET_ID")
     if not sheet_id:
@@ -151,9 +202,13 @@ def write_to_sheet(cleaned_df: pd.DataFrame, start_date: str, end_date: str) -> 
     # Log the run
     runs_ws = get_or_create_worksheet(
         spreadsheet, RUNS_TAB,
-        header=["Timestamp", "Start Date", "End Date", "Rows Scraped", "Rows Added (new)", "Total Rows in Master"],
+        header=["Timestamp", "Start Date", "End Date", "Rows Scraped", "Rows Added (new)",
+                "Duplicates Removed (final pass)", "Total Rows in Master"],
     )
-    total_after = len(existing_keys) + added
+    # Explicit final safety-net dedupe across the whole tab (see docstring)
+    removed = final_dedupe_pass(master_ws)
+    total_after = len(existing_keys) + added - removed
+
     runs_ws.append_row(
         [
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -161,12 +216,17 @@ def write_to_sheet(cleaned_df: pd.DataFrame, start_date: str, end_date: str) -> 
             end_date,
             len(cleaned_df),
             added,
+            removed,
             total_after,
         ],
         value_input_option="USER_ENTERED",
     )
 
-    return {"rows_scraped": len(cleaned_df), "rows_added": added, "total_rows": total_after}
+    all_clinics_raw = os.environ.get("ALL_CLINICS", "")
+    if all_clinics_raw:
+        update_clinics_tab(spreadsheet, [c for c in all_clinics_raw.split("|") if c.strip()])
+
+    return {"rows_scraped": len(cleaned_df), "rows_added": added, "duplicates_removed": removed, "total_rows": total_after}
 
 
 if __name__ == "__main__":
@@ -183,4 +243,5 @@ if __name__ == "__main__":
     df = clean_raw_workbook(raw_file)
     result = write_to_sheet(df, start_date, end_date)
     print(f"\n✅ Done. Scraped {result['rows_scraped']} rows, added {result['rows_added']} new, "
+          f"removed {result['duplicates_removed']} duplicate(s) in final pass, "
           f"Master Data now has {result['total_rows']} rows.")

@@ -38,6 +38,12 @@ MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "6"))
 # only process the first N clinics — for cheaply testing a fix like this
 # one instead of burning a full 35-clinic run per attempt.
 CLINIC_LIMIT = int(os.environ.get("CLINIC_LIMIT", "0")) or None
+# User-facing feature (not debug): restrict the scrape to specific named
+# clinics, e.g. from the web app's clinic multi-select. Pipe-delimited
+# since clinic names can't contain "|" but a couple do contain commas
+# in principle, so comma-joining would be unsafe.
+CLINIC_NAMES_RAW = os.environ.get("CLINIC_NAMES", "").strip()
+CLINIC_NAMES = [c.strip() for c in CLINIC_NAMES_RAW.split("|") if c.strip()] if CLINIC_NAMES_RAW else None
 WEBPT_URL = "https://app.webpt.com"
 
 if not START_DATE or not END_DATE:
@@ -611,7 +617,20 @@ def run_scheduler_history_by_clinic():
         open_browser()
         login()
         go_to_scheduler_history()
-        all_clinics = get_all_clinics()
+        full_clinic_list = get_all_clinics()
+        # Publish the FULL discovered clinic list (before any filtering) so the
+        # web app's clinic dropdown always stays in sync with what WebPT
+        # actually has, regardless of what this particular run was scoped to.
+        gh_out_early = os.environ.get("GITHUB_OUTPUT")
+        if gh_out_early:
+            with open(gh_out_early, "a") as f:
+                f.write(f"all_clinics={'|'.join(full_clinic_list)}\n")
+
+        all_clinics = full_clinic_list
+        if CLINIC_NAMES:
+            wanted = {c.lower() for c in CLINIC_NAMES}
+            all_clinics = [c for c in all_clinics if c.lower() in wanted]
+            log(f"   🎯 Restricted to {len(all_clinics)} selected clinic(s): {', '.join(all_clinics)}")
         if CLINIC_LIMIT:
             log(f"   🐞 DEBUG MODE: limiting to first {CLINIC_LIMIT} clinic(s) (CLINIC_LIMIT set).")
             all_clinics = all_clinics[:CLINIC_LIMIT]

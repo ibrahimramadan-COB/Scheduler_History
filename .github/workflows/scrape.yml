@@ -9,6 +9,10 @@ on:
       end_date:
         description: "End date (MM/DD/YYYY)"
         required: true
+      clinics:
+        description: "Only scrape these clinics (pipe-separated, e.g. Allerton|Astoria). Blank = all clinics."
+        required: false
+        default: ""
       clinic_limit:
         description: "DEBUG ONLY: only process the first N clinics (blank = all)"
         required: false
@@ -46,6 +50,7 @@ jobs:
           END_DATE: ${{ inputs.end_date }}
           WEBPT_USERNAME: ${{ secrets.WEBPT_USERNAME }}
           WEBPT_PASSWORD: ${{ secrets.WEBPT_PASSWORD }}
+          CLINIC_NAMES: ${{ inputs.clinics }}
           CLINIC_LIMIT: ${{ inputs.clinic_limit }}
           MAX_RETRIES: ${{ inputs.max_retries }}
         run: python scripts/scraper.py
@@ -55,15 +60,23 @@ jobs:
           START_DATE: ${{ inputs.start_date }}
           END_DATE: ${{ inputs.end_date }}
           RAW_FILE: ${{ steps.scrape.outputs.raw_file }}
+          ALL_CLINICS: ${{ steps.scrape.outputs.all_clinics }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
         run: python scripts/sheets_writer.py
+
+      - name: Compute safe artifact name
+        id: names
+        run: |
+          SAFE_START=$(echo "${{ inputs.start_date }}" | tr '/' '-')
+          SAFE_END=$(echo "${{ inputs.end_date }}" | tr '/' '-')
+          echo "safe_range=${SAFE_START}_to_${SAFE_END}" >> "$GITHUB_OUTPUT"
 
       - name: Upload raw + cleaned output as a workflow artifact (backup)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: webpt-scheduler-history-${{ inputs.start_date }}_to_${{ inputs.end_date }}
+          name: webpt-scheduler-history-${{ steps.names.outputs.safe_range }}
           path: output/raw/*.xlsx
           retention-days: 30
           if-no-files-found: ignore

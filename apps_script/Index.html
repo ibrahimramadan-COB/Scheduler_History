@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <style>
+    body { font-family: 'Segoe UI', Tahoma, Geneva, sans-serif; background-color: #f4f7f6; margin: 0; padding: 20px; color: #333; }
+    .container { max-width: 640px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
+    h2 { color: #1F4E79; border-bottom: 2px solid #eee; padding-bottom: 10px; margin-top: 0; }
+    h3 { color: #1F4E79; margin-bottom: 5px; }
+    .section { margin-bottom: 25px; padding: 15px; background: #f9fbfd; border-radius: 8px; border: 1px solid #e1e8ed; }
+    .note { font-size: 12px; color: #888; margin-bottom: 12px; }
+    label { font-weight: bold; display: block; margin-bottom: 6px; font-size: 13px; }
+    input[type="date"], select { width: 100%; padding: 9px; margin-bottom: 12px; border: 1px solid #ccc; border-radius: 5px; box-sizing: border-box; }
+    .row { display: flex; gap: 15px; }
+    .row > div { flex: 1; }
+    .checkbox-group { display: flex; align-items: center; margin-bottom: 6px; }
+    .checkbox-group input { margin-right: 8px; width: 15px; height: 15px; }
+    .btn { display: inline-block; padding: 11px 16px; font-size: 14px; font-weight: bold; color: white; border: none; border-radius: 5px; cursor: pointer; }
+    .btn-sync { background-color: #1F4E79; width: 100%; padding: 12px; font-size: 16px; }
+    .btn-quick { background-color: #548235; width: 48%; }
+    .btn-custom { background-color: #8B4513; width: 100%; margin-top: 10px; }
+    .quick-row { display: flex; justify-content: space-between; margin-bottom: 10px; }
+    #console { margin-top: 20px; padding: 15px; background: #222; color: #0f0; font-family: monospace; border-radius: 5px; min-height: 40px; font-size: 13px; white-space: pre-wrap; }
+    .spinner { display: none; margin: 10px auto; border: 4px solid #f3f3f3; border-top: 4px solid #1F4E79; border-radius: 50%; width: 28px; height: 28px; animation: spin 1s linear infinite; }
+    @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    .divider { text-align: center; color: #999; font-size: 12px; margin: 15px 0; }
+    .scroll-list { max-height: 140px; overflow-y: auto; border: 1px solid #ccc; border-radius: 5px; padding: 8px; background: white; margin-bottom: 12px; }
+  </style>
+</head>
+<body>
+
+<div class="container">
+  <h2>🚀 WebPT Scheduler History Automation</h2>
+
+  <!-- ============================================================ -->
+  <!-- SECTION 1: RUN SCRAPER                                        -->
+  <!-- ============================================================ -->
+  <div class="section">
+    <h3>1. Run Scraper</h3>
+    <div class="note">Pulls every clinic's scheduler history for this range into Master Data. Can take a while — check the Actions tab, then come back and run a report below once it's done.</div>
+    <div class="row">
+      <div><label>Start Date</label><input type="date" id="scrapeStart"></div>
+      <div><label>End Date</label><input type="date" id="scrapeEnd"></div>
+    </div>
+    <label>Clinics <span style="font-weight:normal; color:#888;">(none checked = all clinics)</span></label>
+    <div class="scroll-list" id="scrapeClinicChecks"></div>
+    <button class="btn btn-sync" onclick="startSync()">☁️ Trigger GitHub Scrape</button>
+  </div>
+
+  <!-- ============================================================ -->
+  <!-- SECTION 2: REPORTS                                            -->
+  <!-- ============================================================ -->
+  <div class="section">
+    <h3>2. Reports</h3>
+    <div class="note">Use either the quick buttons <b>or</b> the custom filters below — not both in the same run.</div>
+
+    <label>Report Date Range</label>
+    <div class="row">
+      <div><label style="font-size:11px; color:#666;">Start</label><input type="date" id="reportStart"></div>
+      <div><label style="font-size:11px; color:#666;">End</label><input type="date" id="reportEnd"></div>
+    </div>
+
+    <div class="checkbox-group" style="margin-top:5px;">
+      <input type="checkbox" id="chkSendEmail" checked>
+      <label style="margin:0; font-weight:normal;">Email results to the 'Emails' tab list</label>
+    </div>
+
+    <div style="margin-top:15px;">
+      <div class="quick-row">
+        <button class="btn btn-quick" style="background-color:#548235;" onclick="runQuick('created')">📥 Created (CC only)</button>
+        <button class="btn btn-quick" style="background-color:#2E75B6;" onclick="runQuick('vfd')">📊 VFD (all events)</button>
+      </div>
+    </div>
+
+    <div class="divider">— or use custom filters —</div>
+
+    <label>Event Type(s) <span style="font-weight:normal; color:#888;">(none checked = all types)</span></label>
+    <div id="eventTypeChecks"></div>
+
+    <label style="margin-top:10px;">Department (Group)</label>
+    <select id="groupSelect" onchange="onGroupChange()">
+      <option value="">— Any —</option>
+    </select>
+
+    <label>Sub-department (Group 2)</label>
+    <select id="group2Select">
+      <option value="">— Any —</option>
+    </select>
+
+    <label style="margin-top:10px;">Clinics <span style="font-weight:normal; color:#888;">(none checked = all clinics — applies to the quick buttons above too)</span></label>
+    <div class="scroll-list" id="reportClinicChecks"></div>
+
+    <button class="btn btn-custom" onclick="runCustom()">▶️ Run Custom Report</button>
+  </div>
+
+  <div class="spinner" id="loader"></div>
+  <div id="console">System Ready...</div>
+</div>
+
+<script>
+  let departmentData = { groups: [], group2ByGroup: {}, eventTypes: [] };
+
+  window.onload = function () {
+    const today = new Date();
+    const firstOfMonth = new Date(today.getFullYear(), today.getMonth(), 1);
+    const todayStr = today.toISOString().split('T')[0];
+    const firstStr = firstOfMonth.toISOString().split('T')[0];
+
+    document.getElementById('scrapeStart').value = firstStr;
+    document.getElementById('scrapeEnd').value = todayStr;
+    document.getElementById('reportStart').value = firstStr;
+    document.getElementById('reportEnd').value = todayStr;
+
+    google.script.run.withSuccessHandler(onFilterData).getFilterOptions();
+  };
+
+  function onFilterData(data) {
+    departmentData = data;
+
+    const groupSel = document.getElementById('groupSelect');
+    data.groups.forEach(g => {
+      const opt = document.createElement('option');
+      opt.value = g; opt.textContent = g;
+      groupSel.appendChild(opt);
+    });
+
+    const evDiv = document.getElementById('eventTypeChecks');
+    data.eventTypes.forEach(et => {
+      const id = 'ev_' + et.replace(/\s+/g, '_');
+      const wrap = document.createElement('div');
+      wrap.className = 'checkbox-group';
+      wrap.innerHTML = `<input type="checkbox" id="${id}" value="${et}"><label style="margin:0; font-weight:normal;">${et}</label>`;
+      evDiv.appendChild(wrap);
+    });
+
+    // Same clinic list feeds both the scrape section and the report filters
+    ['scrapeClinicChecks', 'reportClinicChecks'].forEach(containerId => {
+      const container = document.getElementById(containerId);
+      if (!data.clinics || data.clinics.length === 0) {
+        container.innerHTML = '<span style="color:#999; font-size:12px;">No clinics found yet — run a scrape first.</span>';
+        return;
+      }
+      data.clinics.forEach(c => {
+        const id = containerId + '_' + c.replace(/\W+/g, '_');
+        const wrap = document.createElement('div');
+        wrap.className = 'checkbox-group';
+        wrap.innerHTML = `<input type="checkbox" id="${id}" value="${c}"><label style="margin:0; font-weight:normal;">${c}</label>`;
+        container.appendChild(wrap);
+      });
+    });
+  }
+
+  function getCheckedValues(containerId) {
+    const vals = [];
+    document.querySelectorAll('#' + containerId + ' input[type=checkbox]:checked').forEach(cb => vals.push(cb.value));
+    return vals;
+  }
+
+  function onGroupChange() {
+    const group = document.getElementById('groupSelect').value;
+    const group2Sel = document.getElementById('group2Select');
+    group2Sel.innerHTML = '<option value="">— Any —</option>';
+    if (group && departmentData.group2ByGroup[group]) {
+      departmentData.group2ByGroup[group].forEach(g2 => {
+        const opt = document.createElement('option');
+        opt.value = g2; opt.textContent = g2;
+        group2Sel.appendChild(opt);
+      });
+    }
+  }
+
+  function logMsg(msg) { document.getElementById('console').innerText = msg; }
+  function toggleLoader(show) { document.getElementById('loader').style.display = show ? 'block' : 'none'; }
+
+  function startSync() {
+    const start = document.getElementById('scrapeStart').value;
+    const end = document.getElementById('scrapeEnd').value;
+    if (!start || !end) return alert("Pick both dates.");
+    const clinics = getCheckedValues('scrapeClinicChecks');
+    toggleLoader(true); logMsg("Calling GitHub to start the scrape...");
+    google.script.run
+      .withSuccessHandler(res => { logMsg(res); toggleLoader(false); })
+      .withFailureHandler(err => { logMsg("Error: " + err.message); toggleLoader(false); })
+      .triggerGitHubSync(formatMDY(start), formatMDY(end), clinics);
+  }
+
+  function formatMDY(isoDate) {
+    const [y, m, d] = isoDate.split('-');
+    return `${m}/${d}/${y}`;
+  }
+
+  function getReportDates() {
+    const start = document.getElementById('reportStart').value;
+    const end = document.getElementById('reportEnd').value;
+    return { start, end };
+  }
+
+  function runQuick(mode) {
+    const { start, end } = getReportDates();
+    if (!start || !end) return alert("Pick a report date range first.");
+    const config = {
+      mode: mode,
+      startDate: start,
+      endDate: end,
+      clinics: getCheckedValues('reportClinicChecks'),
+      sendEmail: document.getElementById('chkSendEmail').checked
+    };
+    toggleLoader(true); logMsg(`Running ${mode === 'created' ? 'Created (CC)' : 'VFD'} report...`);
+    google.script.run
+      .withSuccessHandler(res => { logMsg(res); toggleLoader(false); })
+      .withFailureHandler(err => { logMsg("Error: " + err.message); toggleLoader(false); })
+      .runSchedulerReport(config);
+  }
+
+  function runCustom() {
+    const { start, end } = getReportDates();
+    if (!start || !end) return alert("Pick a report date range first.");
+
+    const eventTypes = [];
+    document.querySelectorAll('#eventTypeChecks input[type=checkbox]:checked').forEach(cb => eventTypes.push(cb.value));
+
+    const config = {
+      mode: 'custom',
+      eventTypes: eventTypes,
+      group: document.getElementById('groupSelect').value,
+      group2: document.getElementById('group2Select').value,
+      clinics: getCheckedValues('reportClinicChecks'),
+      startDate: start,
+      endDate: end,
+      sendEmail: document.getElementById('chkSendEmail').checked
+    };
+    toggleLoader(true); logMsg("Running custom report...");
+    google.script.run
+      .withSuccessHandler(res => { logMsg(res); toggleLoader(false); })
+      .withFailureHandler(err => { logMsg("Error: " + err.message); toggleLoader(false); })
+      .runSchedulerReport(config);
+  }
+</script>
+</body>
+</html>
