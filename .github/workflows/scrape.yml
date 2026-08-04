@@ -1,0 +1,58 @@
+name: WebPT Scheduler History Scrape
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: "Start date (MM/DD/YYYY)"
+        required: true
+      end_date:
+        description: "End date (MM/DD/YYYY)"
+        required: true
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300   # generous ceiling; the scraper itself paces retries
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      - name: Install Python dependencies
+        run: pip install -r scripts/requirements.txt
+
+      - name: Run scraper
+        id: scrape
+        env:
+          START_DATE: ${{ inputs.start_date }}
+          END_DATE: ${{ inputs.end_date }}
+          WEBPT_USERNAME: ${{ secrets.WEBPT_USERNAME }}
+          WEBPT_PASSWORD: ${{ secrets.WEBPT_PASSWORD }}
+        run: python scripts/scraper.py
+
+      - name: Clean + join departments + write to Google Sheet
+        env:
+          START_DATE: ${{ inputs.start_date }}
+          END_DATE: ${{ inputs.end_date }}
+          RAW_FILE: ${{ steps.scrape.outputs.raw_file }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+        run: python scripts/sheets_writer.py
+
+      - name: Upload raw + cleaned output as a workflow artifact (backup)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: webpt-scheduler-history-${{ inputs.start_date }}_to_${{ inputs.end_date }}
+          path: output/raw/*.xlsx
+          retention-days: 30
