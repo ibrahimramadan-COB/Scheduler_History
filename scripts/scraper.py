@@ -34,6 +34,10 @@ END_DATE   = os.environ.get("END_DATE")     # MM/DD/YYYY
 USERNAME   = os.environ.get("WEBPT_USERNAME")
 PASSWORD   = os.environ.get("WEBPT_PASSWORD")
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "6"))
+# Debug aid: set CLINIC_LIMIT=1 (or any small N) via workflow input/env to
+# only process the first N clinics — for cheaply testing a fix like this
+# one instead of burning a full 35-clinic run per attempt.
+CLINIC_LIMIT = int(os.environ.get("CLINIC_LIMIT", "0")) or None
 WEBPT_URL = "https://app.webpt.com"
 
 if not START_DATE or not END_DATE:
@@ -449,6 +453,26 @@ def set_date_range(start_date, end_date, retry_num=1):
     return True
 
 
+def _dump_diagnostics(label):
+    """
+    Saves the current page HTML + a screenshot to output/debug/ so we can
+    see EXACTLY what's on the page when something goes wrong, instead of
+    guessing at another selector blind. Never raises — best effort only.
+    """
+    try:
+        debug_dir = os.path.join(REPO_ROOT, "output", "debug")
+        os.makedirs(debug_dir, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        html_path = os.path.join(debug_dir, f"{label}_{ts}.html")
+        png_path = os.path.join(debug_dir, f"{label}_{ts}.png")
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(driver.page_source)
+        driver.save_screenshot(png_path)
+        log(f"   🐞 Diagnostics saved: {os.path.basename(html_path)}, {os.path.basename(png_path)}")
+    except Exception as e:
+        log(f"   ⚠️ Could not save diagnostics: {e}")
+
+
 # ── GENERATE ──
 def click_generate(retry_num=1):
     t = timer_start()
@@ -466,27 +490,32 @@ def click_generate(retry_num=1):
         return "FAILED"
 
     time.sleep(1 + (retry_num - 1))
-    selectors = [
-        (By.CSS_SELECTOR, "button.fMFURe"),
-        (By.XPATH,        "//div[@id='app-scheduler-change-history-root']//button[contains(text(),'Generate')]"),
-        (By.XPATH,        "//div[@class='Button']//button"),
-        (By.XPATH,        "//button[text()='Generate']"),
-        (By.XPATH,        "//button[contains(@class,'sc-ksBlkl')]"),
-        (By.XPATH,        "//div[contains(@class,'Button')]//button"),
-    ]
-    btn_wait = 15 + ((retry_num - 1) * 15)
+    # Case-insensitive text match via translate() (XPath 1.0 has no lower-case()).
+    # ALSO tries ANY button/clickable element mentioning "generate", not just
+    # inside the app root, in case the container id itself isn't what we think.
+    LOWER = "abcdefghijklmnopqrstuvwxyz"
+    UPPER = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    ci = f"translate(normalize-space(.), '{UPPER}', '{LOWER}')"
+    btn_wait = 15 + ((retry_num - 1) * 10)
     generated = False
-    for by, selector in selectors:
+    text_xpaths = [
+        f"//div[@id='app-scheduler-change-history-root']//button[contains({ci},'generate')]",
+        f"//button[contains({ci},'generate')]",
+        f"//*[self::button or self::a or self::div[@role='button']][contains({ci},'generate')]",
+    ]
+    for xpath in text_xpaths:
         try:
-            btn = WebDriverWait(driver, btn_wait).until(EC.element_to_be_clickable((by, selector)))
+            btn = WebDriverWait(driver, btn_wait).until(EC.element_to_be_clickable((By.XPATH, xpath)))
             driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
             time.sleep(0.5)
             driver.execute_script("arguments[0].click();", btn)
+            log(f"   ✅ Generate clicked via: {xpath}")
             generated = True
             break
-        except:
+        except TimeoutException:
             continue
     if not generated:
+        _dump_diagnostics("generate_button_not_found")
         timer_end(t, "Generate (failed)")
         return "FAILED"
 
@@ -583,6 +612,9 @@ def run_scheduler_history_by_clinic():
         login()
         go_to_scheduler_history()
         all_clinics = get_all_clinics()
+        if CLINIC_LIMIT:
+            log(f"   🐞 DEBUG MODE: limiting to first {CLINIC_LIMIT} clinic(s) (CLINIC_LIMIT set).")
+            all_clinics = all_clinics[:CLINIC_LIMIT]
         batch_results, failed_clinics, no_data_clinics = [], [], []
         if not all_clinics:
             finish_task(success=False, error="No clinics found to query.")

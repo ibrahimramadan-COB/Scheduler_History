@@ -9,6 +9,14 @@ on:
       end_date:
         description: "End date (MM/DD/YYYY)"
         required: true
+      clinic_limit:
+        description: "DEBUG ONLY: only process the first N clinics (blank = all)"
+        required: false
+        default: ""
+      max_retries:
+        description: "DEBUG ONLY: retries per clinic (blank = default 6)"
+        required: false
+        default: ""
 
 jobs:
   scrape:
@@ -38,6 +46,8 @@ jobs:
           END_DATE: ${{ inputs.end_date }}
           WEBPT_USERNAME: ${{ secrets.WEBPT_USERNAME }}
           WEBPT_PASSWORD: ${{ secrets.WEBPT_PASSWORD }}
+          CLINIC_LIMIT: ${{ inputs.clinic_limit }}
+          MAX_RETRIES: ${{ inputs.max_retries }}
         run: python scripts/scraper.py
 
       - name: Clean + join departments + write to Google Sheet
@@ -56,3 +66,13 @@ jobs:
           name: webpt-scheduler-history-${{ inputs.start_date }}_to_${{ inputs.end_date }}
           path: output/raw/*.xlsx
           retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Upload debug diagnostics (page HTML/screenshots on failure)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-diagnostics-${{ github.run_id }}
+          path: output/debug/*
+          retention-days: 14
+          if-no-files-found: ignore
