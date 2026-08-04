@@ -466,25 +466,27 @@ def click_generate(retry_num=1):
         return "FAILED"
 
     time.sleep(1 + (retry_num - 1))
-    selectors = [
-        (By.CSS_SELECTOR, "button.fMFURe"),
-        (By.XPATH,        "//div[@id='app-scheduler-change-history-root']//button[contains(text(),'Generate')]"),
-        (By.XPATH,        "//div[@class='Button']//button"),
-        (By.XPATH,        "//button[text()='Generate']"),
-        (By.XPATH,        "//button[contains(@class,'sc-ksBlkl')]"),
-        (By.XPATH,        "//div[contains(@class,'Button')]//button"),
-    ]
-    btn_wait = 15 + ((retry_num - 1) * 15)
+    # FIX: the previous selectors (button.fMFURe, sc-ksBlkl, etc.) were
+    # styled-components hashed classes — same instability we found and
+    # fixed for 'Custom Range'. They can change per render/build, which
+    # is why every selector failed and burned ~90-180s per attempt before
+    # giving up. Find by TEXT instead, scoped to the app root first.
+    btn_wait = 15 + ((retry_num - 1) * 10)
     generated = False
-    for by, selector in selectors:
+    text_xpaths = [
+        "//div[@id='app-scheduler-change-history-root']//button[contains(normalize-space(.),'Generate')]",
+        "//button[contains(normalize-space(.),'Generate')]",
+    ]
+    for xpath in text_xpaths:
         try:
-            btn = WebDriverWait(driver, btn_wait).until(EC.element_to_be_clickable((by, selector)))
+            btn = WebDriverWait(driver, btn_wait).until(EC.element_to_be_clickable((By.XPATH, xpath)))
             driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
             time.sleep(0.5)
             driver.execute_script("arguments[0].click();", btn)
+            log("   ✅ Generate clicked (text match).")
             generated = True
             break
-        except:
+        except TimeoutException:
             continue
     if not generated:
         timer_end(t, "Generate (failed)")
