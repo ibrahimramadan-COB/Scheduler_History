@@ -33,11 +33,11 @@ START_DATE = os.environ.get("START_DATE")   # MM/DD/YYYY
 END_DATE   = os.environ.get("END_DATE")     # MM/DD/YYYY
 USERNAME   = os.environ.get("WEBPT_USERNAME")
 PASSWORD   = os.environ.get("WEBPT_PASSWORD")
-MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "6"))
+MAX_RETRIES = int(os.environ.get("MAX_RETRIES") or "6")
 # Debug aid: set CLINIC_LIMIT=1 (or any small N) via workflow input/env to
 # only process the first N clinics — for cheaply testing a fix like this
 # one instead of burning a full 35-clinic run per attempt.
-CLINIC_LIMIT = int(os.environ.get("CLINIC_LIMIT", "0")) or None
+CLINIC_LIMIT = int(os.environ.get("CLINIC_LIMIT") or "0") or None
 # User-facing feature (not debug): restrict the scrape to specific named
 # clinics, e.g. from the web app's clinic multi-select. Pipe-delimited
 # since clinic names can't contain "|" but a couple do contain commas
