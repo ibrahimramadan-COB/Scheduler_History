@@ -59,11 +59,18 @@ jobs:
           SHEET_ID: ${{ secrets.SHEET_ID }}
         run: python scripts/sheets_writer.py
 
+      - name: Compute safe artifact name
+        id: names
+        run: |
+          SAFE_START=$(echo "${{ inputs.start_date }}" | tr '/' '-')
+          SAFE_END=$(echo "${{ inputs.end_date }}" | tr '/' '-')
+          echo "safe_range=${SAFE_START}_to_${SAFE_END}" >> "$GITHUB_OUTPUT"
+
       - name: Upload raw + cleaned output as a workflow artifact (backup)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: webpt-scheduler-history-${{ inputs.start_date }}_to_${{ inputs.end_date }}
+          name: webpt-scheduler-history-${{ steps.names.outputs.safe_range }}
           path: output/raw/*.xlsx
           retention-days: 30
           if-no-files-found: ignore
