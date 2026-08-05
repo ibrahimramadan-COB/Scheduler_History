@@ -2,13 +2,39 @@
 Turns the raw per-clinic workbook produced by scraper.py into a flat
 table of EVERY event-log row (Created, Updated, Cancelled, Checked In,
 Checked Out, Deleted, Edited, No Show — whatever WebPT logged), one
-row per event. No event-type filtering happens here on purpose —
-filtering by event type and by department is a Reports-step concern,
-done later in Apps Script against the Master Data tab.
+row per event. Event-TYPE and department filtering happen later, in
+Apps Script against the Master Data tab — but junk/non-appointment
+rows (calendar blocks, placeholder patients) are stripped HERE, at the
+source, so they never make it into Master Data in the first place.
 """
 
 import os
+import re
 import pandas as pd
+
+# APPOINTMENT TYPE values that aren't real appointments — internal
+# calendar-block markers WebPT logs the same way as real appointments.
+JUNK_APPOINTMENT_TYPES = {"blocked schedule", "calendar start", "calendar end"}
+
+_NUMERIC_ONLY_RE = re.compile(r"^\d+$")
+
+
+def is_junk_appointment_type(val) -> bool:
+    if val is None:
+        return False
+    return str(val).strip().lower() in JUNK_APPOINTMENT_TYPES
+
+
+def is_valid_patient(val) -> bool:
+    """False if blank/NaN, or if the value is only digits (a placeholder ID, not a name)."""
+    if val is None:
+        return False
+    s = str(val).strip()
+    if s == "" or s.lower() == "nan":
+        return False
+    if _NUMERIC_ONLY_RE.match(s):
+        return False
+    return True
 
 
 def parse_workbook(input_filepath: str) -> list[dict]:
@@ -81,11 +107,19 @@ def parse_workbook(input_filepath: str) -> list[dict]:
 
 
 def clean_raw_workbook(input_filepath: str) -> pd.DataFrame:
-    """Public entry point: raw workbook path -> flat, de-duplicated DataFrame (all event types)."""
+    """Public entry point: raw workbook path -> flat, filtered, de-duplicated DataFrame (all event types)."""
     rows = parse_workbook(input_filepath)
     df = pd.DataFrame(rows)
     if df.empty:
         return df
+
+    before_junk = len(df)
+    df = df[~df["APPOINTMENT TYPE"].apply(is_junk_appointment_type)]
+    df = df[df["PATIENT"].apply(is_valid_patient)]
+    after_junk = len(df)
+    if before_junk != after_junk:
+        print(f"   🧹 Removed {before_junk - after_junk} row(s): calendar-block appointment types "
+              f"(Blocked Schedule / Calendar Start / Calendar End) or non-name PATIENT values.")
 
     before = len(df)
     df.drop_duplicates(
