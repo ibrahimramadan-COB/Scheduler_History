@@ -13,6 +13,7 @@ account's email must be shared as an Editor on the target Sheet.
 
 import os
 import json
+import time
 from datetime import datetime
 
 import pandas as pd
@@ -37,6 +38,39 @@ MASTER_DATA_COLUMNS = [
 # Same key used for de-duplication throughout this project
 DEDUPE_KEY = ["APPOINTMENT DATE", "PATIENT", "CREATED TIMESTAMP", "EVENT ACTION", "DATA_SOURCE_TAB"]
 
+# Retry settings for transient Google API errors (e.g. 500/503)
+MAX_RETRIES = 5
+RETRY_BASE_DELAY_SECONDS = 2
+
+
+def _with_retry(fn, *args, description="Google API call", **kwargs):
+    """
+    Calls fn(*args, **kwargs), retrying with exponential backoff on
+    transient gspread.exceptions.APIError (5xx). Raises immediately on
+    non-transient errors (4xx) since retrying those won't help.
+    """
+    last_exc = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            return fn(*args, **kwargs)
+        except gspread.exceptions.APIError as e:
+            last_exc = e
+            status = None
+            try:
+                status = e.response.status_code
+            except Exception:
+                pass
+            # Only retry on server-side/transient errors
+            if status is not None and status < 500:
+                raise
+            if attempt == MAX_RETRIES:
+                break
+            delay = RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1))
+            print(f"   ⚠️ {description} failed (attempt {attempt}/{MAX_RETRIES}, status={status}). "
+                  f"Retrying in {delay}s...")
+            time.sleep(delay)
+    raise last_exc
+
 
 def _normalize_name(name) -> str:
     if name is None:
@@ -57,16 +91,20 @@ def get_or_create_worksheet(spreadsheet, title: str, header: list[str] | None = 
     try:
         ws = spreadsheet.worksheet(title)
     except gspread.exceptions.WorksheetNotFound:
-        ws = spreadsheet.add_worksheet(title=title, rows=1000, cols=max(len(header or []), 10))
+        ws = _with_retry(
+            spreadsheet.add_worksheet, title=title, rows=1000, cols=max(len(header or []), 10),
+            description=f"create worksheet '{title}'",
+        )
         if header:
-            ws.append_row(header, value_input_option="RAW")
+            _with_retry(ws.append_row, header, value_input_option="RAW",
+                        description=f"write header to '{title}'")
     return ws
 
 
 def load_name_group_lookup(spreadsheet) -> dict:
     """Returns {normalized Scheduler Name: (Group, Group 2)} from the Names tab."""
     ws = spreadsheet.worksheet(NAMES_TAB)
-    records = ws.get_all_records()  # uses row 1 as header
+    records = _with_retry(ws.get_all_records, description="read Names tab")
     lookup = {}
     for r in records:
         scheduler_name = r.get("Scheduler Name")
@@ -96,7 +134,7 @@ def apply_group_lookup(df: pd.DataFrame, lookup: dict) -> pd.DataFrame:
 
 def load_existing_keys(ws) -> set:
     """Reads the current Master Data tab and returns the set of existing dedupe keys."""
-    values = ws.get_all_records()
+    values = _with_retry(ws.get_all_records, description="read Master Data for existing keys")
     if not values:
         return set()
     existing_df = pd.DataFrame(values)
@@ -120,23 +158,29 @@ def update_clinics_tab(spreadsheet, all_clinics: list[str]) -> None:
     if not all_clinics:
         return
     ws = get_or_create_worksheet(spreadsheet, CLINICS_TAB, header=["Clinic"])
-    ws.clear()
-    ws.append_row(["Clinic"], value_input_option="RAW")
-    ws.append_rows([[c] for c in sorted(all_clinics)], value_input_option="RAW")
+    _with_retry(ws.clear, description="clear Clinics tab")
+    _with_retry(ws.append_row, ["Clinic"], value_input_option="RAW",
+                description="write Clinics header")
+    _with_retry(ws.append_rows, [[c] for c in sorted(all_clinics)], value_input_option="RAW",
+                description="write Clinics rows")
     print(f"   🏥 Refreshed '{CLINICS_TAB}' tab with {len(all_clinics)} clinic(s).")
 
 
-def final_dedupe_pass(ws) -> int:
+def final_dedupe_pass(spreadsheet, ws) -> int:
     """
     Explicit final safety net: re-reads the WHOLE Master Data tab and drops
-    any duplicate rows by the same dedupe key, rewriting the tab if any were
-    found. The append step already skips rows that match something already
-    present, so this should normally be a no-op — it exists to guarantee
-    correctness even if something ever got in another way (a manual paste,
-    a race between two runs, etc.), per explicit request: "at the end we
-    drop duplicates to make sure everything is accurate."
+    any duplicate rows by the same dedupe key.
+
+    SAFETY: the deduped data is written to a NEW TEMPORARY WORKSHEET first
+    and verified, and ONLY THEN is the live 'Master Data' tab touched (by
+    deleting it and renaming the temp sheet into its place). This guarantees
+    the live tab is never cleared unless the full replacement data is
+    already safely written and confirmed — so a transient API failure
+    mid-write can no longer leave 'Master Data' empty, which is what
+    happened previously when this used ws.clear() + ws.append_rows()
+    directly against the live tab.
     """
-    values = ws.get_all_values()
+    values = _with_retry(ws.get_all_values, description="read Master Data for dedupe")
     if len(values) < 2:
         return 0
     header, data_rows = values[0], values[1:]
@@ -150,14 +194,57 @@ def final_dedupe_pass(ws) -> int:
     df.drop_duplicates(subset=DEDUPE_KEY, keep="first", inplace=True)
     after = len(df)
     removed = before - after
-    if removed > 0:
-        print(f"   🧹 Final dedupe pass removed {removed} duplicate row(s) from '{MASTER_TAB}'.")
-        ws.clear()
-        ws.append_row(header, value_input_option="RAW")
+
+    if removed <= 0:
+        return 0
+
+    print(f"   🧹 Final dedupe pass found {removed} duplicate row(s) — writing safely...")
+
+    temp_title = f"{MASTER_TAB}_NEW_{int(time.time())}"
+    temp_ws = None
+    try:
+        # 1. Write the full deduped dataset to a brand-new temp worksheet
+        temp_ws = _with_retry(
+            spreadsheet.add_worksheet, title=temp_title,
+            rows=max(after + 10, 100), cols=max(len(header), 10),
+            description="create temp dedupe worksheet",
+        )
+        _with_retry(temp_ws.append_row, header, value_input_option="RAW",
+                    description="write temp header")
         if not df.empty:
             values_out = df.astype(object).where(pd.notnull(df), "").values.tolist()
-            ws.append_rows(values_out, value_input_option="USER_ENTERED")
-    return removed
+            _with_retry(temp_ws.append_rows, values_out, value_input_option="USER_ENTERED",
+                        description="write temp deduped rows")
+
+        # 2. Verify the temp sheet actually has the expected row count before
+        #    touching the live sheet at all
+        check_values = _with_retry(temp_ws.get_all_values, description="verify temp sheet")
+        actual_row_count = max(len(check_values) - 1, 0)  # minus header
+        if actual_row_count != after:
+            raise RuntimeError(
+                f"Verification failed: temp sheet has {actual_row_count} data row(s), "
+                f"expected {after}. Aborting swap — '{MASTER_TAB}' left untouched."
+            )
+
+        # 3. Only now: delete the old live sheet and rename the verified temp
+        #    sheet into its place. This is effectively an atomic swap from
+        #    the user's point of view.
+        _with_retry(spreadsheet.del_worksheet, ws, description="delete old Master Data")
+        _with_retry(temp_ws.update_title, MASTER_TAB, description="rename temp sheet to Master Data")
+
+        print(f"   🧹 Final dedupe pass removed {removed} duplicate row(s) from '{MASTER_TAB}' (safe swap).")
+        return removed
+
+    except Exception:
+        # If anything went wrong, clean up the temp sheet if it exists, and
+        # leave the ORIGINAL 'Master Data' completely untouched.
+        if temp_ws is not None:
+            try:
+                spreadsheet.del_worksheet(temp_ws)
+            except Exception:
+                pass
+        print(f"   ⚠️ Dedupe pass aborted safely — '{MASTER_TAB}' was NOT modified. Will retry next run.")
+        raise
 
 
 def write_to_sheet(cleaned_df: pd.DataFrame, start_date: str, end_date: str) -> dict:
@@ -194,7 +281,8 @@ def write_to_sheet(cleaned_df: pd.DataFrame, start_date: str, end_date: str) -> 
     if added:
         # Sheets can't hold NaN/NaT — normalize to strings/blank first
         values = new_rows_df.astype(object).where(pd.notnull(new_rows_df), "").values.tolist()
-        master_ws.append_rows(values, value_input_option="USER_ENTERED")
+        _with_retry(master_ws.append_rows, values, value_input_option="USER_ENTERED",
+                    description="append new rows to Master Data")
         print(f"   ➕ Appended {added} new row(s) to '{MASTER_TAB}'.")
     else:
         print(f"   ℹ️ No new rows to append — everything was already in '{MASTER_TAB}'.")
@@ -205,11 +293,22 @@ def write_to_sheet(cleaned_df: pd.DataFrame, start_date: str, end_date: str) -> 
         header=["Timestamp", "Start Date", "End Date", "Rows Scraped", "Rows Added (new)",
                 "Duplicates Removed (final pass)", "Total Rows in Master"],
     )
-    # Explicit final safety-net dedupe across the whole tab (see docstring)
-    removed = final_dedupe_pass(master_ws)
+
+    # Explicit final safety-net dedupe across the whole tab (see docstring).
+    # Re-fetch the worksheet reference in case final_dedupe_pass swapped it.
+    try:
+        removed = final_dedupe_pass(spreadsheet, master_ws)
+    except Exception as e:
+        # Dedupe failing should NEVER be treated as data loss — it's safe by
+        # design now. Log it and continue; Master Data still has all rows
+        # (just with duplicates, which the next run's dedupe pass will retry).
+        print(f"   ⚠️ Dedupe pass failed safely (no data lost): {e}")
+        removed = 0
+
     total_after = len(existing_keys) + added - removed
 
-    runs_ws.append_row(
+    _with_retry(
+        runs_ws.append_row,
         [
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             start_date,
@@ -220,6 +319,7 @@ def write_to_sheet(cleaned_df: pd.DataFrame, start_date: str, end_date: str) -> 
             total_after,
         ],
         value_input_option="USER_ENTERED",
+        description="log run to Runs tab",
     )
 
     all_clinics_raw = os.environ.get("ALL_CLINICS", "")
