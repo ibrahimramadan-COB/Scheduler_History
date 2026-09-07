@@ -1,9 +1,12 @@
 """
 Takes the cleaned (all-event-types) DataFrame from cleaner.py, joins in
 GROUP / GROUP 2 by matching CREATOR USER against the 'Names' tab's
-'Scheduler Name' column, appends any genuinely new rows to the 'Master
-Data' tab in the Google Sheet (deduped against what's already there),
-and appends one row to the 'Runs' tab logging this run's date range.
+'Scheduler Name' column, and UPSERTS into the 'Master Data' tab: for
+any row whose A-I key (APPOINTMENT DATE, APPOINTMENT TYPE, PATIENT,
+CASE, CLINIC, CALENDAR NAME, CREATOR USER, CREATED TIMESTAMP,
+EVENT ACTION) already exists, the FRESH scrape's version always wins
+— every column, not just the key fields. This is what guarantees
+Master Data reflects the newest scrape, never a stale earlier one.
 
 Auth: a Google service account JSON key, passed via the
 GOOGLE_SERVICE_ACCOUNT_JSON env var (the *contents* of the key file,
@@ -35,8 +38,14 @@ MASTER_DATA_COLUMNS = [
     "DETAILS", "GROUP", "GROUP 2", "SOURCE_FILE", "DATA_SOURCE_TAB",
 ]
 
-# Same key used for de-duplication throughout this project
-DEDUPE_KEY = ["APPOINTMENT DATE", "PATIENT", "CREATED TIMESTAMP", "EVENT ACTION", "DATA_SOURCE_TAB"]
+# The TRUE identity of an event — columns A-I only. Anything scraped again
+# with the same values here IS the same real-world event; whichever scrape
+# produced it most recently should win on every OTHER column (DETAILS,
+# GROUP, GROUP 2, SOURCE_FILE, DATA_SOURCE_TAB).
+DEDUPE_KEY = [
+    "APPOINTMENT DATE", "APPOINTMENT TYPE", "PATIENT", "CASE",
+    "CLINIC", "CALENDAR NAME", "CREATOR USER", "CREATED TIMESTAMP", "EVENT ACTION",
+]
 
 # Retry settings for transient Google API errors (e.g. 500/503)
 MAX_RETRIES = 5
@@ -60,7 +69,6 @@ def _with_retry(fn, *args, description="Google API call", **kwargs):
                 status = e.response.status_code
             except Exception:
                 pass
-            # Only retry on server-side/transient errors
             if status is not None and status < 500:
                 raise
             if attempt == MAX_RETRIES:
@@ -76,6 +84,24 @@ def _normalize_name(name) -> str:
     if name is None:
         return ""
     return " ".join(str(name).strip().lower().split())
+
+
+def _truncate_timestamp_to_date(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Drops the time-of-day from CREATED TIMESTAMP, keeping only the date.
+    This has to happen BEFORE dedupe/upsert — otherwise a row already
+    stored with a truncated timestamp (from a prior maintenance pass)
+    would never match the same event scraped again with a full
+    timestamp, breaking both dedupe AND "newest wins".
+    """
+    if "CREATED TIMESTAMP" not in df.columns or df.empty:
+        return df
+    df = df.copy()
+    parsed = pd.to_datetime(df["CREATED TIMESTAMP"], errors="coerce")
+    date_only = parsed.dt.normalize()
+    # Where parsing failed, keep the original value rather than losing data
+    df["CREATED TIMESTAMP"] = date_only.where(parsed.notna(), df["CREATED TIMESTAMP"])
+    return df
 
 
 def get_client() -> gspread.Client:
@@ -132,22 +158,6 @@ def apply_group_lookup(df: pd.DataFrame, lookup: dict) -> pd.DataFrame:
     return df
 
 
-def load_existing_keys(ws) -> set:
-    """Reads the current Master Data tab and returns the set of existing dedupe keys."""
-    values = _with_retry(ws.get_all_records, description="read Master Data for existing keys")
-    if not values:
-        return set()
-    existing_df = pd.DataFrame(values)
-    missing_cols = [c for c in DEDUPE_KEY if c not in existing_df.columns]
-    if missing_cols:
-        return set()
-    keys = set(
-        tuple(str(v) for v in row)
-        for row in existing_df[DEDUPE_KEY].itertuples(index=False, name=None)
-    )
-    return keys
-
-
 def update_clinics_tab(spreadsheet, all_clinics: list[str]) -> None:
     """
     Overwrites the 'Clinics' tab with the FULL list of clinics WebPT reported
@@ -166,84 +176,47 @@ def update_clinics_tab(spreadsheet, all_clinics: list[str]) -> None:
     print(f"   🏥 Refreshed '{CLINICS_TAB}' tab with {len(all_clinics)} clinic(s).")
 
 
-def final_dedupe_pass(spreadsheet, ws) -> int:
+def write_master_data_safely(spreadsheet, live_ws, df: pd.DataFrame) -> None:
     """
-    Explicit final safety net: re-reads the WHOLE Master Data tab and drops
-    any duplicate rows by the same dedupe key.
-
-    SAFETY: the deduped data is written to a NEW TEMPORARY WORKSHEET first
-    and verified, and ONLY THEN is the live 'Master Data' tab touched (by
-    deleting it and renaming the temp sheet into its place). This guarantees
-    the live tab is never cleared unless the full replacement data is
-    already safely written and confirmed — so a transient API failure
-    mid-write can no longer leave 'Master Data' empty, which is what
-    happened previously when this used ws.clear() + ws.append_rows()
-    directly against the live tab.
+    Writes the FULL final Master Data content via a safe temp-sheet-swap:
+    write to a brand-new temp worksheet, verify the row count landed
+    correctly, and ONLY THEN delete the live sheet and rename the temp
+    sheet into its place. A transient API failure mid-write can never
+    leave 'Master Data' empty or half-written — it stays exactly as it
+    was until the replacement is fully verified.
     """
-    values = _with_retry(ws.get_all_values, description="read Master Data for dedupe")
-    if len(values) < 2:
-        return 0
-    header, data_rows = values[0], values[1:]
-    df = pd.DataFrame(data_rows, columns=header)
-
-    missing_cols = [c for c in DEDUPE_KEY if c not in df.columns]
-    if missing_cols:
-        return 0
-
-    before = len(df)
-    df.drop_duplicates(subset=DEDUPE_KEY, keep="first", inplace=True)
-    after = len(df)
-    removed = before - after
-
-    if removed <= 0:
-        return 0
-
-    print(f"   🧹 Final dedupe pass found {removed} duplicate row(s) — writing safely...")
-
     temp_title = f"{MASTER_TAB}_NEW_{int(time.time())}"
     temp_ws = None
     try:
-        # 1. Write the full deduped dataset to a brand-new temp worksheet
         temp_ws = _with_retry(
             spreadsheet.add_worksheet, title=temp_title,
-            rows=max(after + 10, 100), cols=max(len(header), 10),
-            description="create temp dedupe worksheet",
+            rows=max(len(df) + 10, 100), cols=max(len(MASTER_DATA_COLUMNS), 10),
+            description="create temp Master Data worksheet",
         )
-        _with_retry(temp_ws.append_row, header, value_input_option="RAW",
+        _with_retry(temp_ws.append_row, MASTER_DATA_COLUMNS, value_input_option="RAW",
                     description="write temp header")
         if not df.empty:
             values_out = df.astype(object).where(pd.notnull(df), "").values.tolist()
             _with_retry(temp_ws.append_rows, values_out, value_input_option="USER_ENTERED",
-                        description="write temp deduped rows")
+                        description="write temp rows")
 
-        # 2. Verify the temp sheet actually has the expected row count before
-        #    touching the live sheet at all
         check_values = _with_retry(temp_ws.get_all_values, description="verify temp sheet")
         actual_row_count = max(len(check_values) - 1, 0)  # minus header
-        if actual_row_count != after:
+        if actual_row_count != len(df):
             raise RuntimeError(
                 f"Verification failed: temp sheet has {actual_row_count} data row(s), "
-                f"expected {after}. Aborting swap — '{MASTER_TAB}' left untouched."
+                f"expected {len(df)}. Aborting swap — '{MASTER_TAB}' left untouched."
             )
 
-        # 3. Only now: delete the old live sheet and rename the verified temp
-        #    sheet into its place. This is effectively an atomic swap from
-        #    the user's point of view.
-        _with_retry(spreadsheet.del_worksheet, ws, description="delete old Master Data")
+        _with_retry(spreadsheet.del_worksheet, live_ws, description="delete old Master Data")
         _with_retry(temp_ws.update_title, MASTER_TAB, description="rename temp sheet to Master Data")
 
-        print(f"   🧹 Final dedupe pass removed {removed} duplicate row(s) from '{MASTER_TAB}' (safe swap).")
-        return removed
-
     except Exception:
-        # If anything went wrong, clean up the temp sheet if it exists, and
-        # leave the ORIGINAL 'Master Data' completely untouched.
         if temp_ws is not None:
             try:
                 spreadsheet.del_worksheet(temp_ws)
             except Exception:
                 pass
-        print(f"   ⚠️ Dedupe pass aborted safely — '{MASTER_TAB}' was NOT modified. Will retry next run.")
         raise
 
 
@@ -257,56 +230,64 @@ def write_to_sheet(cleaned_df: pd.DataFrame, start_date: str, end_date: str) -> 
 
     lookup = load_name_group_lookup(spreadsheet)
     cleaned_df = apply_group_lookup(cleaned_df, lookup)
+    cleaned_df = _truncate_timestamp_to_date(cleaned_df)
 
-    # Make sure every expected column exists, in the right order
     for col in MASTER_DATA_COLUMNS:
         if col not in cleaned_df.columns:
             cleaned_df[col] = None
     cleaned_df = cleaned_df[MASTER_DATA_COLUMNS]
 
     master_ws = get_or_create_worksheet(spreadsheet, MASTER_TAB, header=MASTER_DATA_COLUMNS)
-    existing_keys = load_existing_keys(master_ws)
-    print(f"   📥 Master Data currently has {len(existing_keys)} row(s) on record.")
 
-    def row_key(row):
-        return tuple(str(row[c]) for c in DEDUPE_KEY)
+    existing_records = _with_retry(master_ws.get_all_records, description="read existing Master Data")
+    existing_df = pd.DataFrame(existing_records) if existing_records else pd.DataFrame(columns=MASTER_DATA_COLUMNS)
+    existing_df = _truncate_timestamp_to_date(existing_df)
+    existing_count = len(existing_df)
+    print(f"   📥 Master Data currently has {existing_count} row(s) on record.")
 
-    if not cleaned_df.empty:
-        is_new = cleaned_df.apply(lambda r: row_key(r) not in existing_keys, axis=1)
-        new_rows_df = cleaned_df[is_new]
-    else:
-        new_rows_df = cleaned_df
+    for col in MASTER_DATA_COLUMNS:
+        if col not in existing_df.columns:
+            existing_df[col] = None
+    existing_df = existing_df[MASTER_DATA_COLUMNS] if not existing_df.empty else existing_df
 
-    added = len(new_rows_df)
-    if added:
-        # Sheets can't hold NaN/NaT — normalize to strings/blank first
-        values = new_rows_df.astype(object).where(pd.notnull(new_rows_df), "").values.tolist()
-        _with_retry(master_ws.append_rows, values, value_input_option="USER_ENTERED",
-                    description="append new rows to Master Data")
-        print(f"   ➕ Appended {added} new row(s) to '{MASTER_TAB}'.")
-    else:
-        print(f"   ℹ️ No new rows to append — everything was already in '{MASTER_TAB}'.")
+    # Existing rows FIRST, this run's fresh scrape LAST — so keep="last"
+    # always prefers whatever the most recent scrape produced for any
+    # event that appears in both.
+    combined = pd.concat([existing_df, cleaned_df], ignore_index=True, sort=False)
+    for col in MASTER_DATA_COLUMNS:
+        if col not in combined.columns:
+            combined[col] = None
+    combined = combined[MASTER_DATA_COLUMNS]
 
-    # Log the run
+    before = len(combined)
+    combined.drop_duplicates(subset=DEDUPE_KEY, keep="last", inplace=True)
+    after = len(combined)
+    removed = before - after
+
+    # For the run log: how many of this run's rows were genuinely new
+    # (as opposed to updates to something that already existed)
+    new_keys = set(
+        tuple(str(v) for v in row) for row in cleaned_df[DEDUPE_KEY].itertuples(index=False, name=None)
+    )
+    existing_keys = set(
+        tuple(str(v) for v in row) for row in existing_df[DEDUPE_KEY].itertuples(index=False, name=None)
+    ) if not existing_df.empty else set()
+    genuinely_new = len(new_keys - existing_keys)
+    updated_existing = len(new_keys & existing_keys)
+
+    write_master_data_safely(spreadsheet, master_ws, combined)
+    # get_or_create_worksheet's cached ref is now stale (old sheet deleted) —
+    # re-fetch for anything below that might need it in the future.
+    master_ws = spreadsheet.worksheet(MASTER_TAB)
+
+    print(f"   ➕ {genuinely_new} new row(s), 🔄 {updated_existing} existing row(s) refreshed with newer data, "
+          f"🧹 {removed} exact-duplicate row(s) collapsed. Master Data now has {after} row(s).")
+
     runs_ws = get_or_create_worksheet(
         spreadsheet, RUNS_TAB,
-        header=["Timestamp", "Start Date", "End Date", "Rows Scraped", "Rows Added (new)",
-                "Duplicates Removed (final pass)", "Total Rows in Master"],
+        header=["Timestamp", "Start Date", "End Date", "Rows Scraped", "New Rows",
+                "Existing Rows Refreshed", "Duplicates Collapsed", "Total Rows in Master"],
     )
-
-    # Explicit final safety-net dedupe across the whole tab (see docstring).
-    # Re-fetch the worksheet reference in case final_dedupe_pass swapped it.
-    try:
-        removed = final_dedupe_pass(spreadsheet, master_ws)
-    except Exception as e:
-        # Dedupe failing should NEVER be treated as data loss — it's safe by
-        # design now. Log it and continue; Master Data still has all rows
-        # (just with duplicates, which the next run's dedupe pass will retry).
-        print(f"   ⚠️ Dedupe pass failed safely (no data lost): {e}")
-        removed = 0
-
-    total_after = len(existing_keys) + added - removed
-
     _with_retry(
         runs_ws.append_row,
         [
@@ -314,9 +295,10 @@ def write_to_sheet(cleaned_df: pd.DataFrame, start_date: str, end_date: str) -> 
             start_date,
             end_date,
             len(cleaned_df),
-            added,
+            genuinely_new,
+            updated_existing,
             removed,
-            total_after,
+            after,
         ],
         value_input_option="USER_ENTERED",
         description="log run to Runs tab",
@@ -326,7 +308,13 @@ def write_to_sheet(cleaned_df: pd.DataFrame, start_date: str, end_date: str) -> 
     if all_clinics_raw:
         update_clinics_tab(spreadsheet, [c for c in all_clinics_raw.split("|") if c.strip()])
 
-    return {"rows_scraped": len(cleaned_df), "rows_added": added, "duplicates_removed": removed, "total_rows": total_after}
+    return {
+        "rows_scraped": len(cleaned_df),
+        "new_rows": genuinely_new,
+        "updated_rows": updated_existing,
+        "duplicates_collapsed": removed,
+        "total_rows": after,
+    }
 
 
 if __name__ == "__main__":
@@ -342,6 +330,6 @@ if __name__ == "__main__":
 
     df = clean_raw_workbook(raw_file)
     result = write_to_sheet(df, start_date, end_date)
-    print(f"\n✅ Done. Scraped {result['rows_scraped']} rows, added {result['rows_added']} new, "
-          f"removed {result['duplicates_removed']} duplicate(s) in final pass, "
+    print(f"\n✅ Done. Scraped {result['rows_scraped']} rows: {result['new_rows']} new, "
+          f"{result['updated_rows']} refreshed with newer data, {result['duplicates_collapsed']} duplicate(s) collapsed. "
           f"Master Data now has {result['total_rows']} rows.")
