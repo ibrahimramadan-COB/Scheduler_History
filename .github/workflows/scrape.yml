@@ -65,6 +65,15 @@ jobs:
           SHEET_ID: ${{ secrets.SHEET_ID }}
         run: python scripts/sheets_writer.py
 
+      - name: Run Master Data maintenance (dedupe A-I, truncate timestamp, recompute status)
+        env:
+          MAINTENANCE_URL: ${{ secrets.MAINTENANCE_URL }}
+          MAINTENANCE_SECRET: ${{ secrets.MAINTENANCE_SECRET }}
+        run: |
+          curl -L --fail --max-time 400 -X POST "$MAINTENANCE_URL" \
+            -H "Content-Type: application/json" \
+            -d "{\"secret\": \"$MAINTENANCE_SECRET\"}"
+
       - name: Compute safe artifact name
         id: names
         run: |
