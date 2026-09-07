@@ -21,6 +21,7 @@ from datetime import datetime
 
 import pandas as pd
 import gspread
+from gspread.utils import rowcol_to_a1
 from google.oauth2.service_account import Credentials
 
 SCOPES = [
@@ -50,6 +51,10 @@ DEDUPE_KEY = [
 # Retry settings for transient Google API errors (e.g. 500/503)
 MAX_RETRIES = 5
 RETRY_BASE_DELAY_SECONDS = 2
+
+# Rows per write call when updating Master Data in place. Keeps each
+# request's payload well under Google's per-request size limit.
+WRITE_CHUNK_SIZE = 5000
 
 
 def _with_retry(fn, *args, description="Google API call", **kwargs):
@@ -176,48 +181,68 @@ def update_clinics_tab(spreadsheet, all_clinics: list[str]) -> None:
     print(f"   🏥 Refreshed '{CLINICS_TAB}' tab with {len(all_clinics)} clinic(s).")
 
 
-def write_master_data_safely(spreadsheet, live_ws, df: pd.DataFrame) -> None:
+def write_master_data_safely(live_ws, df: pd.DataFrame) -> None:
     """
-    Writes the FULL final Master Data content via a safe temp-sheet-swap:
-    write to a brand-new temp worksheet, verify the row count landed
-    correctly, and ONLY THEN delete the live sheet and rename the temp
-    sheet into its place. A transient API failure mid-write can never
-    leave 'Master Data' empty or half-written — it stays exactly as it
-    was until the replacement is fully verified.
+    Writes the FULL final Master Data content DIRECTLY INTO THE SAME SHEET,
+    in chunks — never creating a second sheet. The old temp-sheet-then-swap
+    approach briefly needed roughly DOUBLE the workbook's cell budget (old
+    sheet + new sheet coexisting), which is exactly what broke at scale —
+    158K+ rows x 14 cols is ~2.2M cells, and doubling that pushed the whole
+    workbook over Google's hard 10,000,000-cell-per-workbook ceiling.
+
+    This writes in place instead: grow the sheet if needed, write the new
+    data in chunks (keeps each API call well under Google's payload size
+    limit), blank out any leftover old rows beyond the new data, then
+    shrink the sheet back down to exactly what's needed — reclaiming quota
+    instead of consuming double.
     """
-    temp_title = f"{MASTER_TAB}_NEW_{int(time.time())}"
-    temp_ws = None
-    try:
-        temp_ws = _with_retry(
-            spreadsheet.add_worksheet, title=temp_title,
-            rows=max(len(df) + 10, 100), cols=max(len(MASTER_DATA_COLUMNS), 10),
-            description="create temp Master Data worksheet",
-        )
-        _with_retry(temp_ws.append_row, MASTER_DATA_COLUMNS, value_input_option="RAW",
-                    description="write temp header")
-        if not df.empty:
-            values_out = df.astype(object).where(pd.notnull(df), "").values.tolist()
-            _with_retry(temp_ws.append_rows, values_out, value_input_option="USER_ENTERED",
-                        description="write temp rows")
+    header = MASTER_DATA_COLUMNS
+    num_cols = len(header)
+    values_out = df.astype(object).where(pd.notnull(df), "").values.tolist() if not df.empty else []
+    all_rows = [header] + values_out
+    new_row_count = len(all_rows)
 
-        check_values = _with_retry(temp_ws.get_all_values, description="verify temp sheet")
-        actual_row_count = max(len(check_values) - 1, 0)  # minus header
-        if actual_row_count != len(df):
-            raise RuntimeError(
-                f"Verification failed: temp sheet has {actual_row_count} data row(s), "
-                f"expected {len(df)}. Aborting swap — '{MASTER_TAB}' left untouched."
-            )
+    old_row_count = live_ws.row_count
+    old_col_count = live_ws.col_count
 
-        _with_retry(spreadsheet.del_worksheet, live_ws, description="delete old Master Data")
-        _with_retry(temp_ws.update_title, MASTER_TAB, description="rename temp sheet to Master Data")
+    # Grow up front if needed (single resize call — much cheaper than a
+    # whole second sheet, since it only adds the DELTA, not a duplicate).
+    target_row_count = max(old_row_count, new_row_count)
+    target_col_count = max(old_col_count, num_cols)
+    if target_row_count != old_row_count or target_col_count != old_col_count:
+        _with_retry(live_ws.resize, rows=target_row_count, cols=target_col_count,
+                    description="grow Master Data sheet to fit")
 
-    except Exception:
-        if temp_ws is not None:
-            try:
-                spreadsheet.del_worksheet(temp_ws)
-            except Exception:
-                pass
-        raise
+    # Write in chunks, directly into this same sheet.
+    for start in range(0, new_row_count, WRITE_CHUNK_SIZE):
+        chunk = all_rows[start:start + WRITE_CHUNK_SIZE]
+        first_row, last_row = start + 1, start + len(chunk)  # 1-indexed
+        range_name = f"A{first_row}:{rowcol_to_a1(last_row, num_cols)}"
+        _with_retry(live_ws.update, values=chunk, range_name=range_name,
+                    value_input_option="USER_ENTERED",
+                    description=f"write Master Data rows {first_row}-{last_row}")
+
+    # Blank out any leftover old rows beyond the new data, in the SAME pass
+    # (avoids a separate clear() call and any window where content is stale
+    # instead of just absent).
+    if old_row_count > new_row_count:
+        for start in range(new_row_count, old_row_count, WRITE_CHUNK_SIZE):
+            end = min(start + WRITE_CHUNK_SIZE, old_row_count)
+            blank_rows = [[""] * num_cols for _ in range(end - start)]
+            range_name = f"A{start + 1}:{rowcol_to_a1(end, num_cols)}"
+            _with_retry(live_ws.update, values=blank_rows, range_name=range_name,
+                        value_input_option="USER_ENTERED",
+                        description=f"blank leftover rows {start + 1}-{end}")
+
+    # Shrink back down to exactly what's needed — this is what actually
+    # reclaims workbook cell quota for next time; Sheets never does it
+    # automatically.
+    if new_row_count < target_row_count:
+        try:
+            _with_retry(live_ws.resize, rows=new_row_count, cols=num_cols,
+                        description="trim Master Data sheet back to size")
+        except Exception as e:
+            print(f"   ⚠️ Could not trim sheet dimensions after write (non-fatal): {e}")
 
 
 def write_to_sheet(cleaned_df: pd.DataFrame, start_date: str, end_date: str) -> dict:
@@ -275,10 +300,7 @@ def write_to_sheet(cleaned_df: pd.DataFrame, start_date: str, end_date: str) -> 
     genuinely_new = len(new_keys - existing_keys)
     updated_existing = len(new_keys & existing_keys)
 
-    write_master_data_safely(spreadsheet, master_ws, combined)
-    # get_or_create_worksheet's cached ref is now stale (old sheet deleted) —
-    # re-fetch for anything below that might need it in the future.
-    master_ws = spreadsheet.worksheet(MASTER_TAB)
+    write_master_data_safely(master_ws, combined)
 
     print(f"   ➕ {genuinely_new} new row(s), 🔄 {updated_existing} existing row(s) refreshed with newer data, "
           f"🧹 {removed} exact-duplicate row(s) collapsed. Master Data now has {after} row(s).")
