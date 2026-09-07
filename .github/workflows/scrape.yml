@@ -55,7 +55,7 @@ jobs:
           MAX_RETRIES: ${{ inputs.max_retries }}
         run: python scripts/scraper.py
 
-      - name: Clean + join departments + write to Google Sheet
+      - name: Clean + join departments + route to monthly Google Sheet files
         env:
           START_DATE: ${{ inputs.start_date }}
           END_DATE: ${{ inputs.end_date }}
@@ -63,16 +63,15 @@ jobs:
           ALL_CLINICS: ${{ steps.scrape.outputs.all_clinics }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
+          MONTHLY_FILE_SHARE_EMAIL: ${{ secrets.MONTHLY_FILE_SHARE_EMAIL }}
+          MONTHLY_FILES_FOLDER_ID: ${{ secrets.MONTHLY_FILES_FOLDER_ID }}
         run: python scripts/sheets_writer.py
 
-      - name: Run Master Data maintenance (dedupe A-I, truncate timestamp, recompute status)
-        env:
-          MAINTENANCE_URL: ${{ secrets.MAINTENANCE_URL }}
-          MAINTENANCE_SECRET: ${{ secrets.MAINTENANCE_SECRET }}
-        run: |
-          curl -L --fail --max-time 400 -X POST "$MAINTENANCE_URL" \
-            -H "Content-Type: application/json" \
-            -d "{\"secret\": \"$MAINTENANCE_SECRET\"}"
+      # NOTE: the old "Master Data maintenance" (Appointment Status column)
+      # step is paused here — it operated on the single Master Data tab in
+      # the main sheet, which no longer receives appointment data now that
+      # writes are split across monthly files. MaintenanceEngine.gs needs a
+      # rewrite to run per monthly file before this step comes back.
 
       - name: Compute safe artifact name
         id: names
