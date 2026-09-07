@@ -110,9 +110,17 @@ def _truncate_timestamp_to_date(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def get_client() -> gspread.Client:
+    file_path = os.environ.get("GOOGLE_SERVICE_ACCOUNT_FILE")
+    if file_path:
+        if not os.path.exists(file_path):
+            raise RuntimeError(f"GOOGLE_SERVICE_ACCOUNT_FILE points to a file that doesn't exist: {file_path}")
+        creds = Credentials.from_service_account_file(file_path, scopes=SCOPES)
+        return gspread.authorize(creds)
+
     raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
     if not raw:
-        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON env var is not set.")
+        raise RuntimeError("Set either GOOGLE_SERVICE_ACCOUNT_FILE (path to the key file) "
+                            "or GOOGLE_SERVICE_ACCOUNT_JSON (the key file's raw content).")
     info = json.loads(raw)
     creds = Credentials.from_service_account_info(info, scopes=SCOPES)
     return gspread.authorize(creds)
