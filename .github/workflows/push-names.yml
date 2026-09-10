@@ -17,7 +17,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install Python dependencies
-        run: pip install gspread google-auth snowflake-connector-python cryptography
+        run: pip install gspread google-auth -r scripts/requirements.txt
 
       - name: Push Names to Snowflake
         env:
