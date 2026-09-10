@@ -35,15 +35,36 @@ def read_names_from_sheet(sheet_id: str) -> list[tuple]:
     client = get_sheets_client()
     spreadsheet = client.open_by_key(sheet_id)
     ws = spreadsheet.worksheet(NAMES_TAB)
-    records = ws.get_all_records()  # keyed by header row, so column order doesn't matter
+
+    # Read raw values instead of get_all_records() — the header row has a
+    # duplicate 'Group'/'Group 2' column somewhere, which get_all_records()
+    # refuses to handle. Taking the FIRST occurrence of each needed header
+    # name sidesteps that without requiring the sheet itself to be cleaned up.
+    all_values = ws.get_all_values()
+    if not all_values:
+        return []
+    header = all_values[0]
+    data_rows = all_values[1:]
+
+    def first_index(name):
+        for i, h in enumerate(header):
+            if h.strip() == name:
+                return i
+        return None
+
+    idx_name = first_index("Scheduler Name")
+    idx_group = first_index("Group")
+    idx_group2 = first_index("Group 2")
+    if idx_name is None:
+        raise RuntimeError(f"'{NAMES_TAB}' tab has no 'Scheduler Name' column. Headers found: {header}")
 
     rows = []
-    for r in records:
-        scheduler_name = str(r.get("Scheduler Name", "")).strip()
+    for r in data_rows:
+        scheduler_name = str(r[idx_name]).strip() if idx_name < len(r) else ""
         if not scheduler_name:
             continue
-        group_name = str(r.get("Group", "")).strip()
-        group_2 = str(r.get("Group 2", "")).strip()
+        group_name = str(r[idx_group]).strip() if idx_group is not None and idx_group < len(r) else ""
+        group_2 = str(r[idx_group2]).strip() if idx_group2 is not None and idx_group2 < len(r) else ""
         rows.append((scheduler_name, group_name, group_2))
     return rows
 
