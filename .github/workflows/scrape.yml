@@ -25,7 +25,7 @@ on:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 300   # generous ceiling; the scraper itself paces retries
+    timeout-minutes: 300
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -55,23 +55,20 @@ jobs:
           MAX_RETRIES: ${{ inputs.max_retries }}
         run: python scripts/scraper.py
 
-      - name: Clean + join departments + route to monthly Google Sheet files
+      - name: Clean + load to Snowflake
         env:
           START_DATE: ${{ inputs.start_date }}
           END_DATE: ${{ inputs.end_date }}
           RAW_FILE: ${{ steps.scrape.outputs.raw_file }}
-          ALL_CLINICS: ${{ steps.scrape.outputs.all_clinics }}
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          SHEET_ID: ${{ secrets.SHEET_ID }}
-          MONTHLY_FILE_SHARE_EMAIL: ${{ secrets.MONTHLY_FILE_SHARE_EMAIL }}
-          MONTHLY_FILES_FOLDER_ID: ${{ secrets.MONTHLY_FILES_FOLDER_ID }}
-        run: python scripts/sheets_writer.py
-
-      # NOTE: the old "Master Data maintenance" (Appointment Status column)
-      # step is paused here — it operated on the single Master Data tab in
-      # the main sheet, which no longer receives appointment data now that
-      # writes are split across monthly files. MaintenanceEngine.gs needs a
-      # rewrite to run per monthly file before this step comes back.
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PRIVATE_KEY: ${{ secrets.SNOWFLAKE_PRIVATE_KEY }}
+          SNOWFLAKE_PRIVATE_KEY_PASSPHRASE: ${{ secrets.SNOWFLAKE_PRIVATE_KEY_PASSPHRASE }}
+          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+          SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
+          SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
+          SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_ROLE }}
+        run: python scripts/snowflake_writer.py
 
       - name: Compute safe artifact name
         id: names
@@ -80,7 +77,7 @@ jobs:
           SAFE_END=$(echo "${{ inputs.end_date }}" | tr '/' '-')
           echo "safe_range=${SAFE_START}_to_${SAFE_END}" >> "$GITHUB_OUTPUT"
 
-      - name: Upload raw + cleaned output as a workflow artifact (backup)
+      - name: Upload raw output as a workflow artifact (backup)
         if: always()
         uses: actions/upload-artifact@v4
         with:
