@@ -155,7 +155,7 @@ def load_to_snowflake(df: pd.DataFrame) -> dict:
 
         tmp_path = os.path.join(tempfile.gettempdir(), "scheduler_history_batch.csv")
         stage_columns = ["ROW_KEY"] + ALL_COLUMNS + ["SOURCE_RUN_ID"]
-        df[stage_columns].to_csv(tmp_path, index=False, na_rep="", encoding="utf-8",
+        df[stage_columns].to_csv(tmp_path, index=False, na_rep="", encoding="utf-8-sig",
                                   quotechar='"', quoting=csv.QUOTE_ALL)
 
         staging_table = f"{TABLE_NAME}_BATCH"
@@ -172,7 +172,8 @@ def load_to_snowflake(df: pd.DataFrame) -> dict:
         cursor.execute(f"""
             COPY INTO {staging_table} ({col_list})
             FROM @{STAGE_NAME}/scheduler_history_batch.csv
-            FILE_FORMAT = (TYPE = CSV FIELD_OPTIONALLY_ENCLOSED_BY = '"' SKIP_HEADER = 1 NULL_IF = (''))
+            FILE_FORMAT = (TYPE = CSV FIELD_OPTIONALLY_ENCLOSED_BY = '"' SKIP_HEADER = 1
+                            NULL_IF = ('') ENCODING = 'UTF8')
         """)
 
         set_clause = ", ".join(f"target.{c} = source.{c}" for c in ALL_COLUMNS)
