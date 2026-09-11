@@ -66,7 +66,27 @@ def read_names_from_sheet(sheet_id: str) -> list[tuple]:
         group_name = str(r[idx_group]).strip() if idx_group is not None and idx_group < len(r) else ""
         group_2 = str(r[idx_group2]).strip() if idx_group2 is not None and idx_group2 < len(r) else ""
         rows.append((scheduler_name, group_name, group_2))
-    return rows
+
+    # DEDUPE by Scheduler Name (case/whitespace-insensitive) before this ever
+    # reaches Snowflake — a duplicate here silently doubles every appointment
+    # that person touches once joined into the enriched view (this exact bug
+    # was found live: Ahmed Abdullah, moataz ahmed, Medical Auditing were all
+    # duplicated in the sheet and doubling/tripling their appointment counts).
+    seen = {}
+    duplicates_found = []
+    for scheduler_name, group_name, group_2 in rows:
+        key = " ".join(scheduler_name.lower().split())
+        if key in seen:
+            duplicates_found.append(scheduler_name)
+            continue
+        seen[key] = (scheduler_name, group_name, group_2)
+
+    if duplicates_found:
+        print(f"   ⚠️ Found and dropped {len(duplicates_found)} duplicate Scheduler Name row(s) in the "
+              f"'{NAMES_TAB}' tab — only the FIRST occurrence of each was kept: {', '.join(sorted(set(duplicates_found)))}")
+        print(f"   ⚠️ Fix the '{NAMES_TAB}' tab itself to remove these duplicates — this is a safety net, not a substitute.")
+
+    return list(seen.values())
 
 
 def push_to_snowflake(rows: list[tuple]) -> int:
