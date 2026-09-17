@@ -1,34 +1,17 @@
 """
-scripts/snowflake_writer.py — loads a cleaned CSV (from cleaner.py) into
-EXTERNAL_DATA.PUBLIC.SCHEDULER_HISTORY_DATA2.
+scripts/snowflake_writer.py — delete-and-replace per EVENT into
+SCHEDULER_HISTORY_DATA2. Now also writes CHANGED_FROM / CHANGED_TO.
 
-CHANGED FROM THE OLD VERSION: instead of computing a per-ROW hash and
-MERGE-ing row by row, this computes a per-EVENT key (the parent
-appointment: Appointment Date + Type + Patient + Case + Clinic +
-Calendar Name) and does DELETE-then-INSERT for every event this batch
-touches. WebPT's Scheduler History report always returns an event's
-FULL log when its Appointment Date falls in the scraped range — never
-a partial history — so replacing the whole event is always safe and
-correct, and avoids the old per-row MERGE silently colliding two
-distinct same-day log lines under one identity hash.
+Requires the table to have these 2 new columns (run once):
+    ALTER TABLE EXTERNAL_DATA.PUBLIC.SCHEDULER_HISTORY_DATA2 ADD COLUMN CHANGED_FROM STRING;
+    ALTER TABLE EXTERNAL_DATA.PUBLIC.SCHEDULER_HISTORY_DATA2 ADD COLUMN CHANGED_TO STRING;
 
-FIRST_SEEN_AT is preserved across replacements (looked up before the
-delete); only LAST_UPDATED_AT and SOURCE_RUN_ID move forward.
-
-Usage:
-    python snowflake_writer.py <cleaned_input.csv>
-
-Env vars (same as before):
-    SNOWFLAKE_ACCOUNT, SNOWFLAKE_USER,
-    SNOWFLAKE_PRIVATE_KEY (PEM contents) or SNOWFLAKE_PRIVATE_KEY_FILE,
-    SNOWFLAKE_PRIVATE_KEY_PASSPHRASE (optional),
-    SNOWFLAKE_WAREHOUSE, SNOWFLAKE_DATABASE, SNOWFLAKE_SCHEMA, SNOWFLAKE_ROLE
+Usage: python snowflake_writer.py <cleaned_input.csv>
 """
 
 import os
 import sys
 import hashlib
-
 import pandas as pd
 import snowflake.connector
 from cryptography.hazmat.primitives import serialization
@@ -41,22 +24,15 @@ FIRST_SEEN_LOOKUP_TABLE = "EXTERNAL_DATA.PUBLIC._OLD_FIRST_SEEN"
 EVENT_KEY_FIELDS = ["APPOINTMENT DATE", "APPOINTMENT TYPE", "PATIENT", "CASE", "CLINIC", "CALENDAR NAME"]
 
 COLUMN_RENAME = {
-    "APPOINTMENT DATE": "APPOINTMENT_DATE",
-    "APPOINTMENT TYPE": "APPOINTMENT_TYPE",
-    "PATIENT": "PATIENT",
-    "CASE": "CASE_TITLE",
-    "CLINIC": "CLINIC",
-    "CALENDAR NAME": "CALENDAR_NAME",
-    "CREATOR USER": "CREATOR_USER",
-    "CREATED TIMESTAMP": "CREATED_TIMESTAMP",
-    "EVENT ACTION": "EVENT_ACTION",
-    "DETAILS": "DETAILS",
-    "SOURCE_FILE": "SOURCE_FILE",
-    "DATA_SOURCE_TAB": "DATA_SOURCE_TAB",
+    "APPOINTMENT DATE": "APPOINTMENT_DATE", "APPOINTMENT TYPE": "APPOINTMENT_TYPE", "PATIENT": "PATIENT",
+    "CASE": "CASE_TITLE", "CLINIC": "CLINIC", "CALENDAR NAME": "CALENDAR_NAME",
+    "CREATOR USER": "CREATOR_USER", "CREATED TIMESTAMP": "CREATED_TIMESTAMP", "EVENT ACTION": "EVENT_ACTION",
+    "DETAILS": "DETAILS", "CHANGED FROM": "CHANGED_FROM", "CHANGED TO": "CHANGED_TO",
+    "SOURCE_FILE": "SOURCE_FILE", "DATA_SOURCE_TAB": "DATA_SOURCE_TAB",
 }
 DATA_COLUMNS = ["APPOINTMENT_DATE", "APPOINTMENT_TYPE", "PATIENT", "CASE_TITLE", "CLINIC",
                 "CALENDAR_NAME", "CREATOR_USER", "CREATED_TIMESTAMP", "EVENT_ACTION",
-                "DETAILS", "SOURCE_FILE", "DATA_SOURCE_TAB"]
+                "DETAILS", "CHANGED_FROM", "CHANGED_TO", "SOURCE_FILE", "DATA_SOURCE_TAB"]
 
 
 def get_connection():
@@ -75,8 +51,7 @@ def get_connection():
         with open(key_file, "rb") as f:
             key_bytes = f.read()
     else:
-        key_pem = os.environ["SNOWFLAKE_PRIVATE_KEY"]
-        key_bytes = key_pem.encode()
+        key_bytes = os.environ["SNOWFLAKE_PRIVATE_KEY"].encode()
 
     private_key = serialization.load_pem_private_key(key_bytes, password=passphrase_bytes, backend=default_backend())
     private_key_der = private_key.private_bytes(
@@ -85,10 +60,8 @@ def get_connection():
         encryption_algorithm=serialization.NoEncryption(),
     )
 
-    connect_kwargs = dict(
-        user=user, account=account, private_key=private_key_der,
-        warehouse=warehouse, database=database, schema=schema,
-    )
+    connect_kwargs = dict(user=user, account=account, private_key=private_key_der,
+                           warehouse=warehouse, database=database, schema=schema)
     if role:
         connect_kwargs["role"] = role
     return snowflake.connector.connect(**connect_kwargs)
@@ -107,7 +80,6 @@ def prepare_dataframe(csv_path: str) -> pd.DataFrame:
         return df
 
     df["EVENT_KEY"] = df.apply(compute_event_key, axis=1)
-
     df["APPOINTMENT DATE"] = pd.to_datetime(df["APPOINTMENT DATE"], errors="coerce").dt.strftime("%Y-%m-%d")
     df["CREATED TIMESTAMP"] = pd.to_datetime(df["CREATED TIMESTAMP"], errors="coerce").dt.strftime("%Y-%m-%d")
 
@@ -129,9 +101,8 @@ def load_to_snowflake(conn, df: pd.DataFrame, run_id: str):
 
         cols = ["EVENT_KEY"] + DATA_COLUMNS
         placeholders = ", ".join(["%s"] * len(cols))
-        insert_sql = f"INSERT INTO {STAGING_TABLE} ({', '.join(cols)}) VALUES ({placeholders})"
         values = df[cols].astype(object).where(pd.notnull(df[cols]), None).values.tolist()
-        cursor.executemany(insert_sql, values)
+        cursor.executemany(f"INSERT INTO {STAGING_TABLE} ({', '.join(cols)}) VALUES ({placeholders})", values)
         print(f"📤 Staged {len(values)} row(s), {df['EVENT_KEY'].nunique()} distinct event(s).")
 
         cursor.execute(f"""
@@ -141,7 +112,6 @@ def load_to_snowflake(conn, df: pd.DataFrame, run_id: str):
             WHERE EVENT_KEY IN (SELECT DISTINCT EVENT_KEY FROM {STAGING_TABLE})
             GROUP BY EVENT_KEY
         """)
-
         cursor.execute(f"""
             DELETE FROM {TARGET_TABLE}
             WHERE EVENT_KEY IN (SELECT DISTINCT EVENT_KEY FROM {STAGING_TABLE})
@@ -169,10 +139,8 @@ def main():
         print("Usage: python snowflake_writer.py <cleaned_input.csv>")
         sys.exit(1)
 
-    csv_path = sys.argv[1]
     run_id = os.environ.get("GITHUB_RUN_ID", "manual_run")
-
-    df = prepare_dataframe(csv_path)
+    df = prepare_dataframe(sys.argv[1])
     conn = get_connection()
     try:
         load_to_snowflake(conn, df, run_id)
