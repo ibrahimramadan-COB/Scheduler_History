@@ -74,11 +74,11 @@ def compute_event_key(row) -> str:
     return hashlib.sha256("‖".join(parts).encode("utf-8")).hexdigest()
 
 
-def prepare_dataframe(csv_path: str) -> pd.DataFrame:
-    df = pd.read_csv(csv_path, encoding="utf-8-sig")
+def prepare_dataframe_from_df(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
 
+    df = df.copy()
     df["EVENT_KEY"] = df.apply(compute_event_key, axis=1)
     df["APPOINTMENT DATE"] = pd.to_datetime(df["APPOINTMENT DATE"], errors="coerce").dt.strftime("%Y-%m-%d")
     df["CREATED TIMESTAMP"] = pd.to_datetime(df["CREATED TIMESTAMP"], errors="coerce").dt.strftime("%Y-%m-%d")
@@ -88,6 +88,11 @@ def prepare_dataframe(csv_path: str) -> pd.DataFrame:
         if col not in df.columns:
             df[col] = None
     return df[["EVENT_KEY"] + DATA_COLUMNS]
+
+
+def prepare_dataframe(csv_path: str) -> pd.DataFrame:
+    df = pd.read_csv(csv_path, encoding="utf-8-sig")
+    return prepare_dataframe_from_df(df)
 
 
 def load_to_snowflake(conn, df: pd.DataFrame, run_id: str):
@@ -135,12 +140,21 @@ def load_to_snowflake(conn, df: pd.DataFrame, run_id: str):
 
 
 def main():
-    if len(sys.argv) != 2:
-        print("Usage: python snowflake_writer.py <cleaned_input.csv>")
+    raw_file = os.environ.get("RAW_FILE")
+    if not raw_file:
+        print("Error: RAW_FILE env var not set.")
         sys.exit(1)
 
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from cleaner import clean_raw_workbook
+
+    cleaned_df = clean_raw_workbook(raw_file)
+    if cleaned_df.empty:
+        print("⚠️ No rows survived cleaning — nothing to load.")
+        return
+
     run_id = os.environ.get("GITHUB_RUN_ID", "manual_run")
-    df = prepare_dataframe(sys.argv[1])
+    df = prepare_dataframe_from_df(cleaned_df)
     conn = get_connection()
     try:
         load_to_snowflake(conn, df, run_id)
